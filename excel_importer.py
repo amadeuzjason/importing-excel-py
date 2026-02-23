@@ -6,6 +6,13 @@ import threading
 import time
 from datetime import datetime
 import os
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG, 
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    filename='excel_importer.log',
+                    filemode='w')
 
 class ExcelImporterApp:
     def __init__(self, root):
@@ -164,7 +171,7 @@ class ExcelImporterApp:
         self.tree['columns'] = columns
         
         for col in columns:
-            self.tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(c))
+            self.tree.heading(col, text=col)
             self.tree.column(col, width=100, minwidth=50)
         
         # Add data (limited to 1000 rows for performance)
@@ -176,7 +183,10 @@ class ExcelImporterApp:
     
     def sort_treeview(self, column):
         if self.df is None:
+            logging.warning("Attempted to sort but no data loaded")
             return
+        
+        logging.debug(f"Sorting column: {column}, current sort column: {self.current_sort_column}")
         
         if self.current_sort_column == column:
             self.current_sort_order = 'desc' if self.current_sort_order == 'asc' else 'asc'
@@ -184,6 +194,7 @@ class ExcelImporterApp:
             self.current_sort_column = column
             self.current_sort_order = 'asc'
         
+        logging.debug(f"New sort order: {self.current_sort_order} for column: {column}")
         self.sort_data(self.current_sort_order, column)
     
     def sort_data(self, order='asc', column=None):
@@ -191,20 +202,19 @@ class ExcelImporterApp:
             return
         
         if column is None:
-            # Get currently selected column from treeview
-            focus = self.tree.focus()
-            if not focus:
-                messagebox.showinfo("Info", "Please select a column to sort by clicking its header")
+            # If no column specified, use the first column
+            if len(self.df.columns) > 0:
+                column = self.df.columns[0]
+            else:
+                messagebox.showinfo("Info", "No columns available for sorting")
                 return
-            
-            # This is simplified - in real implementation, track sort column
-            messagebox.showinfo("Info", "Click on column header to sort")
-            return
         
         try:
             data_to_sort = self.filtered_df if self.filtered_df is not None else self.df
             
             if column not in data_to_sort.columns:
+                logging.error(f"Column '{column}' not found in data. Available columns: {list(data_to_sort.columns)}")
+                messagebox.showerror("Error", f"Column '{column}' not found in data")
                 return
             
             # Handle different data types for sorting
@@ -239,34 +249,59 @@ class ExcelImporterApp:
         
         try:
             if column not in self.df.columns:
+                messagebox.showerror("Error", f"Column '{column}' not found in data")
                 return
             
-            # Handle different filter types
+            # Handle different filter types with proper NaN handling
             if pd.api.types.is_numeric_dtype(self.df[column]):
-                try:
-                    num_value = float(value)
-                    self.filtered_df = self.df[self.df[column] == num_value]
-                except ValueError:
-                    messagebox.showerror("Error", "Please enter a valid number for numeric column")
-                    return
+                # For numeric columns (including large IDs like UniqueId, CID),
+                # use string-based contains matching so users can search by
+                # full value or partial digits (prefix/substring).
+                if value.lower() in ['null', 'nan', 'na', '']:
+                    self.filtered_df = self.df[pd.isna(self.df[column])]
+                else:
+                    col_as_str = self.df[column].astype(str)
+                    self.filtered_df = self.df[
+                        col_as_str.str.contains(value, case=False, na=False)
+                    ]
             
             elif pd.api.types.is_datetime64_any_dtype(self.df[column]):
                 try:
                     date_value = pd.to_datetime(value)
-                    self.filtered_df = self.df[self.df[column] == date_value]
+                    self.filtered_df = self.df[
+                        (self.df[column] == date_value) | 
+                        (pd.isna(self.df[column]) & (value.lower() in ['null', 'nan', 'na', '']))
+                    ]
                 except ValueError:
-                    # Try partial match for dates
-                    self.filtered_df = self.df[self.df[column].astype(str).str.contains(value, case=False, na=False)]
+                    # Try partial match for dates or NaN values
+                    if value.lower() in ['null', 'nan', 'na', '']:
+                        self.filtered_df = self.df[pd.isna(self.df[column])]
+                    else:
+                        # Try partial string matching for date strings
+                        self.filtered_df = self.df[
+                            self.df[column].astype(str).str.contains(value, case=False, na=False)
+                        ]
             
             else:
-                # Text filter
-                self.filtered_df = self.df[self.df[column].astype(str).str.contains(value, case=False, na=False)]
+                # Text filter with proper NaN handling
+                if value.lower() in ['null', 'nan', 'na']:
+                    self.filtered_df = self.df[pd.isna(self.df[column])]
+                else:
+                    # Use fillna to handle NaN values in string columns
+                    self.filtered_df = self.df[
+                        self.df[column].astype(str).str.contains(value, case=False, na=False)
+                    ]
             
-            self.display_data(self.filtered_df)
-            self.status_var.set(f"Filter applied: {column} contains '{value}' - {len(self.filtered_df)} rows found")
+            if len(self.filtered_df) == 0:
+                self.status_var.set(f"No results found for '{value}' in column '{column}'")
+                messagebox.showinfo("Filter Results", f"No data found matching '{value}' in column '{column}'")
+            else:
+                self.display_data(self.filtered_df)
+                self.status_var.set(f"Filter applied: {column} contains '{value}' - {len(self.filtered_df)} rows found")
             
         except Exception as e:
             messagebox.showerror("Error", f"Filter error: {str(e)}")
+            print(f"Filter error details: {e}")
     
     def clear_filter(self):
         self.filtered_df = None
@@ -308,27 +343,54 @@ class ExcelImporterApp:
         if self.df is None:
             return
         
+        # Get the data to export (filtered or original)
         data_to_export = self.filtered_df if self.filtered_df is not None else self.df
         
         if data_to_export.empty:
             messagebox.showinfo("Info", "No data to export")
             return
         
+        # Apply current sort order if any
+        if self.current_sort_column and self.current_sort_column in data_to_export.columns:
+            data_to_export = data_to_export.sort_values(
+                by=self.current_sort_column, 
+                ascending=(self.current_sort_order == 'asc')
+            )
+        
         file_path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            title="Save Export File"
         )
         
         if not file_path:
             return
         
         try:
-            data_to_export.to_excel(file_path, index=False, engine='openpyxl')
-            messagebox.showinfo("Success", f"Data exported successfully to {file_path}")
-            self.status_var.set(f"Data exported: {len(data_to_export)} rows")
+            # Export with additional metadata about filter and sort
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                data_to_export.to_excel(writer, sheet_name='Data', index=False)
+                
+                # Create a metadata sheet
+                metadata = {
+                    'Export Information': [
+                        f'Export Date: {pd.Timestamp.now()}',
+                        f'Source File: {getattr(self, "current_file", "Unknown")}',
+                        f'Total Rows Exported: {len(data_to_export)}',
+                        f'Filter Applied: {self.filter_value_var.get() if self.filter_value_var.get() else "None"}',
+                        f'Filter Column: {self.filter_column_var.get() if self.filter_column_var.get() else "None"}',
+                        f'Sort Column: {self.current_sort_column if self.current_sort_column else "None"}',
+                        f'Sort Order: {self.current_sort_order if self.current_sort_order else "None"}'
+                    ]
+                }
+                pd.DataFrame(metadata).to_excel(writer, sheet_name='Metadata', index=False)
+            
+            messagebox.showinfo("Success", f"Data exported successfully to {file_path}\n\nRows exported: {len(data_to_export)}\nSort: {self.current_sort_column or 'None'} {self.current_sort_order or ''}\nFilter: {self.filter_column_var.get() or 'None'} = {self.filter_value_var.get() or 'None'}")
+            self.status_var.set(f"Data exported: {len(data_to_export)} rows with current sort/filter")
             
         except Exception as e:
             messagebox.showerror("Error", f"Export failed: {str(e)}")
+            print(f"Export error details: {e}")
     
     def show_statistics(self):
         if self.df is None:
@@ -362,11 +424,21 @@ class ExcelImporterApp:
         # Handle treeview clicks for sorting
         region = self.tree.identify_region(event.x, event.y)
         if region == "heading":
-            column = self.tree.identify_column(event.x)
-            col_index = int(column.replace('#', '')) - 1
-            if col_index < len(self.tree['columns']):
-                col_name = self.tree['columns'][col_index]
-                self.sort_treeview(col_name)
+            # Get the actual column ID that was clicked
+            column_id = self.tree.identify_column(event.x)
+            
+            # Convert column ID to index (e.g., '#1' -> 0)
+            try:
+                col_index = int(column_id.replace('#', '')) - 1
+                
+                # Safety check to ensure index is within bounds
+                if 0 <= col_index < len(self.tree['columns']):
+                    col_name = self.tree['columns'][col_index]
+                    self.sort_treeview(col_name)
+                    
+            except (ValueError, IndexError) as e:
+                print(f"Error identifying column: {e}")
+                return
 
 def main():
     root = tk.Tk()
